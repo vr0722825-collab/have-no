@@ -1,0 +1,2759 @@
+const crypto = require("crypto");
+const express = require("express");
+
+const { onRequest } = require("firebase-functions/https");
+const { initializeApp } = require("firebase-admin/app");
+const {
+  getFirestore,
+  FieldValue,
+} = require("firebase-admin/firestore");
+
+initializeApp();
+
+const db = getFirestore();
+
+const app = express();
+
+app.use(express.json({ limit: "1mb" }));
+
+// ============================================================
+// CONFIGURATION
+// ============================================================
+
+const DEFAULT_BUDGET = 2000;
+
+const ALLOWED_USERS = [
+  "vicky",
+  "raajan",
+  "obito",
+  "alpha",
+];
+
+const SHARED_PASSWORD =
+  process.env.SHARED_PASSWORD || "4Friends";
+
+const SESSION_SECRET =
+  process.env.SESSION_SECRET ||
+  "CHANGE_THIS_TO_A_LONG_RANDOM_SECRET_123456789";
+
+const DEFAULT_ITEMS = [
+  "Vegetables",
+  "Chicken",
+  "Water",
+  "Electric bill",
+  "Home things",
+];
+
+// ============================================================
+// SECURITY / COOKIE
+// ============================================================
+
+function sign(value) {
+  return crypto
+    .createHmac("sha256", SESSION_SECRET)
+    .update(value)
+    .digest("hex");
+}
+
+function createAuthCookie(username) {
+  const payload = Buffer.from(
+    JSON.stringify({
+      username,
+      expires: Date.now() + 1000 * 60 * 60 * 24 * 30,
+    })
+  ).toString("base64url");
+
+  return `${payload}.${sign(payload)}`;
+}
+
+function readCookie(req) {
+  const header = req.headers.cookie || "";
+
+  const cookies = {};
+
+  header.split(";").forEach((part) => {
+    const index = part.indexOf("=");
+
+    if (index === -1) return;
+
+    const key = part.slice(0, index).trim();
+    const value = part.slice(index + 1).trim();
+
+    cookies[key] = decodeURIComponent(value);
+  });
+
+  return cookies["budget_auth"] || null;
+}
+
+function getCurrentUser(req) {
+  const cookie = readCookie(req);
+
+  if (!cookie) return null;
+
+  const parts = cookie.split(".");
+
+  if (parts.length !== 2) return null;
+
+  const [payload, signature] = parts;
+
+  const expected = sign(payload);
+
+  if (signature.length !== expected.length) return null;
+
+  if (
+    !crypto.timingSafeEqual(
+      Buffer.from(signature),
+      Buffer.from(expected)
+    )
+  ) {
+    return null;
+  }
+
+  try {
+    const data = JSON.parse(
+      Buffer.from(payload, "base64url").toString()
+    );
+
+    if (!data.username) return null;
+
+    if (Date.now() > Number(data.expires)) {
+      return null;
+    }
+
+    if (!ALLOWED_USERS.includes(data.username)) {
+      return null;
+    }
+
+    return data.username;
+  } catch {
+    return null;
+  }
+}
+
+function requireAuth(req, res, next) {
+  const username = getCurrentUser(req);
+
+  if (!username) {
+    return res.status(401).json({
+      error: "Please log in.",
+    });
+  }
+
+  req.username = username;
+
+  next();
+}
+
+// ============================================================
+// FIRESTORE REFERENCES
+// ============================================================
+
+function userRef(username) {
+  return db.collection("users").doc(username);
+}
+
+function itemsRef(username) {
+  return userRef(username).collection("items");
+}
+
+function budgetsRef(username) {
+  return userRef(username).collection("budgets");
+}
+
+function spendsRef(username) {
+  return userRef(username).collection("spends");
+}
+
+// ============================================================
+// HELPERS
+// ============================================================
+
+function monthKey(value) {
+  const text = String(value || "");
+
+  if (!/^\d{4}-\d{2}$/.test(text)) {
+    return null;
+  }
+
+  const [year, month] = text.split("-").map(Number);
+
+  if (month < 1 || month > 12) {
+    return null;
+  }
+
+  return text;
+}
+
+function nextMonthKey(month) {
+  const [year, monthNumber] = month
+    .split("-")
+    .map(Number);
+
+  const date = new Date(
+    year,
+    monthNumber - 1,
+    1
+  );
+
+  date.setMonth(date.getMonth() + 1);
+
+  return (
+    date.getFullYear() +
+    "-" +
+    String(date.getMonth() + 1).padStart(2, "0")
+  );
+}
+
+function monthLabel(month) {
+  const [year, monthNumber] = month
+    .split("-")
+    .map(Number);
+
+  return new Date(
+    year,
+    monthNumber - 1,
+    1
+  ).toLocaleString("en-IN", {
+    month: "long",
+    year: "numeric",
+  });
+}
+
+function makeId() {
+  return crypto.randomBytes(12).toString("hex");
+}
+
+// ============================================================
+// INITIALIZE USER
+// ============================================================
+
+async function ensureUser(username) {
+  const ref = userRef(username);
+
+  const snap = await ref.get();
+
+  if (!snap.exists) {
+    await ref.set({
+      username,
+      createdAt: FieldValue.serverTimestamp(),
+    });
+  }
+
+  const itemsSnapshot = await itemsRef(username)
+    .limit(1)
+    .get();
+
+  if (itemsSnapshot.empty) {
+    const batch = db.batch();
+
+    for (const name of DEFAULT_ITEMS) {
+      const itemRef = itemsRef(username).doc(makeId());
+
+      batch.set(itemRef, {
+        name,
+        isDefault: true,
+        createdAt: FieldValue.serverTimestamp(),
+      });
+    }
+
+    await batch.commit();
+  }
+}
+
+async function ensureAllUsers() {
+  for (const username of ALLOWED_USERS) {
+    await ensureUser(username);
+  }
+}
+
+// ============================================================
+// BUDGET
+// ============================================================
+
+async function getBudget(username, month) {
+  const snap = await budgetsRef(username)
+    .doc(month)
+    .get();
+
+  if (!snap.exists) {
+    return {
+      amount: DEFAULT_BUDGET,
+      saved: false,
+    };
+  }
+
+  return {
+    amount: Number(snap.data().amount || 0),
+    saved: true,
+  };
+}
+
+// ============================================================
+// SPEND TOTAL
+// ============================================================
+
+async function getSpent(username, month) {
+  const snapshot = await spendsRef(username)
+    .where("month", "==", month)
+    .get();
+
+  let total = 0;
+
+  snapshot.forEach((doc) => {
+    total += Number(doc.data().amount || 0);
+  });
+
+  return total;
+}
+
+// ============================================================
+// MONTH SUMMARY
+// ============================================================
+
+async function getMonthSummary(username, month) {
+  const budgetData = await getBudget(
+    username,
+    month
+  );
+
+  const spent = await getSpent(
+    username,
+    month
+  );
+
+  return {
+    month,
+    label: monthLabel(month),
+    budget: budgetData.amount,
+    spent,
+    leftover: budgetData.amount - spent,
+    budgetSaved: budgetData.saved,
+  };
+}
+
+// ============================================================
+// LOGIN
+// ============================================================
+
+app.post("/api/login", async (req, res) => {
+  try {
+    const username = String(
+      req.body.username || ""
+    )
+      .trim()
+      .toLowerCase();
+
+    const password = String(
+      req.body.password || ""
+    );
+
+    if (!ALLOWED_USERS.includes(username)) {
+      return res.status(400).json({
+        error: "Wrong username or password.",
+      });
+    }
+
+    if (password !== SHARED_PASSWORD) {
+      return res.status(400).json({
+        error: "Wrong username or password.",
+      });
+    }
+
+    await ensureUser(username);
+
+    const cookie = createAuthCookie(username);
+
+    res.setHeader(
+      "Set-Cookie",
+      [
+        `budget_auth=${encodeURIComponent(cookie)}`,
+        "Max-Age=2592000",
+        "Path=/",
+        "HttpOnly",
+        "Secure",
+        "SameSite=Lax",
+      ].join("; ")
+    );
+
+    res.json({
+      username,
+    });
+  } catch (error) {
+    console.error(error);
+
+    res.status(500).json({
+      error: "Login failed.",
+    });
+  }
+});
+
+// ============================================================
+// LOGOUT
+// ============================================================
+
+app.post("/api/logout", (req, res) => {
+  res.setHeader(
+    "Set-Cookie",
+    [
+      "budget_auth=",
+      "Max-Age=0",
+      "Path=/",
+      "HttpOnly",
+      "Secure",
+      "SameSite=Lax",
+    ].join("; ")
+  );
+
+  res.json({
+    ok: true,
+  });
+});
+
+// ============================================================
+// CURRENT USER
+// ============================================================
+
+app.get("/api/me", (req, res) => {
+  const username = getCurrentUser(req);
+
+  if (!username) {
+    return res.status(401).json({
+      error: "Not logged in.",
+    });
+  }
+
+  res.json({
+    username,
+  });
+});
+
+// ============================================================
+// MONTH DATA
+// ============================================================
+
+app.get(
+  "/api/month",
+  requireAuth,
+  async (req, res) => {
+    try {
+      const month = monthKey(
+        req.query.month
+      );
+
+      if (!month) {
+        return res.status(400).json({
+          error: "Choose a valid month.",
+        });
+      }
+
+      const username = req.username;
+
+      const nextMonth = nextMonthKey(month);
+
+      const current = await getMonthSummary(
+        username,
+        month
+      );
+
+      const next = await getMonthSummary(
+        username,
+        nextMonth
+      );
+
+      const itemsSnapshot = await itemsRef(
+        username
+      )
+        .orderBy("name")
+        .get();
+
+      const items = [];
+
+      itemsSnapshot.forEach((doc) => {
+        const data = doc.data();
+
+        items.push({
+          id: doc.id,
+          name: data.name,
+          is_default: Boolean(
+            data.isDefault
+          ),
+          spent: 0,
+          nextSpent: 0,
+          spends: [],
+        });
+      });
+
+      const itemMap = new Map();
+
+      for (const item of items) {
+        itemMap.set(item.id, item);
+      }
+
+      const spendsSnapshot = await spendsRef(
+        username
+      )
+        .where("month", "==", month)
+        .get();
+
+      spendsSnapshot.forEach((doc) => {
+        const data = doc.data();
+
+        const item = itemMap.get(
+          data.itemId
+        );
+
+        if (!item) return;
+
+        const amount = Number(
+          data.amount || 0
+        );
+
+        item.spent += amount;
+
+        item.spends.push({
+          id: doc.id,
+          amount,
+          note: data.note || "",
+          spentOn: data.spentOn,
+        });
+      });
+
+      const nextSpendsSnapshot =
+        await spendsRef(username)
+          .where("month", "==", nextMonth)
+          .get();
+
+      nextSpendsSnapshot.forEach((doc) => {
+        const data = doc.data();
+
+        const item = itemMap.get(
+          data.itemId
+        );
+
+        if (!item) return;
+
+        item.nextSpent += Number(
+          data.amount || 0
+        );
+      });
+
+      for (const item of items) {
+        item.spends.sort((a, b) => {
+          if (a.spentOn === b.spentOn) {
+            return b.id.localeCompare(a.id);
+          }
+
+          return b.spentOn.localeCompare(
+            a.spentOn
+          );
+        });
+      }
+
+      res.json({
+        ...current,
+        next,
+        items,
+      });
+    } catch (error) {
+      console.error(error);
+
+      res.status(500).json({
+        error: "Could not load month.",
+      });
+    }
+  }
+);
+
+// ============================================================
+// UPDATE BUDGET
+// ============================================================
+
+app.put(
+  "/api/budget",
+  requireAuth,
+  async (req, res) => {
+    try {
+      const month = monthKey(
+        req.body.month
+      );
+
+      const amount = Number(
+        req.body.amount
+      );
+
+      if (!month) {
+        return res.status(400).json({
+          error: "Choose a valid month.",
+        });
+      }
+
+      if (
+        !Number.isFinite(amount) ||
+        amount < 0
+      ) {
+        return res.status(400).json({
+          error:
+            "Enter a valid budget amount.",
+        });
+      }
+
+      await budgetsRef(req.username)
+        .doc(month)
+        .set({
+          amount,
+          updatedAt:
+            FieldValue.serverTimestamp(),
+        });
+
+      res.json({
+        month,
+        amount,
+      });
+    } catch (error) {
+      console.error(error);
+
+      res.status(500).json({
+        error: "Could not save budget.",
+      });
+    }
+  }
+);
+
+// ============================================================
+// ADD ITEM
+// ============================================================
+
+app.post(
+  "/api/items",
+  requireAuth,
+  async (req, res) => {
+    try {
+      const name = String(
+        req.body.name || ""
+      ).trim();
+
+      if (!name) {
+        return res.status(400).json({
+          error:
+            "Enter a name for the new thing.",
+        });
+      }
+
+      const snapshot = await itemsRef(
+        req.username
+      ).get();
+
+      const exists = snapshot.docs.some(
+        (doc) =>
+          String(doc.data().name)
+            .toLowerCase() ===
+          name.toLowerCase()
+      );
+
+      if (exists) {
+        return res.status(400).json({
+          error:
+            "That thing is already on the list.",
+        });
+      }
+
+      const id = makeId();
+
+      await itemsRef(req.username)
+        .doc(id)
+        .set({
+          name,
+          isDefault: false,
+          createdAt:
+            FieldValue.serverTimestamp(),
+        });
+
+      res.json({
+        id,
+        name,
+        is_default: 0,
+      });
+    } catch (error) {
+      console.error(error);
+
+      res.status(500).json({
+        error: "Could not add item.",
+      });
+    }
+  }
+);
+
+// ============================================================
+// EDIT ITEM
+// ============================================================
+
+app.patch(
+  "/api/items/:id",
+  requireAuth,
+  async (req, res) => {
+    try {
+      const id = req.params.id;
+
+      const name = String(
+        req.body.name || ""
+      ).trim();
+
+      if (!name) {
+        return res.status(400).json({
+          error: "Enter a name.",
+        });
+      }
+
+      const itemRef = itemsRef(
+        req.username
+      ).doc(id);
+
+      const itemSnap =
+        await itemRef.get();
+
+      if (!itemSnap.exists) {
+        return res.status(404).json({
+          error: "Item not found.",
+        });
+      }
+
+      const snapshot = await itemsRef(
+        req.username
+      ).get();
+
+      const clash = snapshot.docs.find(
+        (doc) =>
+          doc.id !== id &&
+          String(doc.data().name)
+            .toLowerCase() ===
+            name.toLowerCase()
+      );
+
+      if (clash) {
+        return res.status(400).json({
+          error:
+            "That thing is already on the list.",
+        });
+      }
+
+      await itemRef.update({
+        name,
+        updatedAt:
+          FieldValue.serverTimestamp(),
+      });
+
+      const oldData = itemSnap.data();
+
+      res.json({
+        id,
+        name,
+        is_default: oldData.isDefault
+          ? 1
+          : 0,
+      });
+    } catch (error) {
+      console.error(error);
+
+      res.status(500).json({
+        error: "Could not edit item.",
+      });
+    }
+  }
+);
+
+// ============================================================
+// DELETE ITEM
+// ============================================================
+
+app.delete(
+  "/api/items/:id",
+  requireAuth,
+  async (req, res) => {
+    try {
+      const id = req.params.id;
+
+      const itemRef = itemsRef(
+        req.username
+      ).doc(id);
+
+      const itemSnap =
+        await itemRef.get();
+
+      if (!itemSnap.exists) {
+        return res.status(404).json({
+          error: "Item not found.",
+        });
+      }
+
+      const spendsSnapshot =
+        await spendsRef(req.username)
+          .where("itemId", "==", id)
+          .get();
+
+      const batch = db.batch();
+
+      spendsSnapshot.forEach((doc) => {
+        batch.delete(doc.ref);
+      });
+
+      batch.delete(itemRef);
+
+      await batch.commit();
+
+      res.json({
+        ok: true,
+      });
+    } catch (error) {
+      console.error(error);
+
+      res.status(500).json({
+        error: "Could not delete item.",
+      });
+    }
+  }
+);
+
+// ============================================================
+// ADD SPEND
+// ============================================================
+
+app.post(
+  "/api/spends",
+  requireAuth,
+  async (req, res) => {
+    try {
+      const month = monthKey(
+        req.body.month
+      );
+
+      const itemId = String(
+        req.body.itemId || ""
+      );
+
+      const amount = Number(
+        req.body.amount
+      );
+
+      const note = String(
+        req.body.note || ""
+      ).trim();
+
+      const spentOn = String(
+        req.body.spentOn || ""
+      ).slice(0, 10);
+
+      if (!month) {
+        return res.status(400).json({
+          error: "Choose a valid month.",
+        });
+      }
+
+      if (
+        !Number.isFinite(amount) ||
+        amount <= 0
+      ) {
+        return res.status(400).json({
+          error:
+            "Enter a spend amount greater than 0.",
+        });
+      }
+
+      if (
+        !/^\d{4}-\d{2}-\d{2}$/.test(
+          spentOn
+        )
+      ) {
+        return res.status(400).json({
+          error: "Choose a date.",
+        });
+      }
+
+      const itemSnap =
+        await itemsRef(req.username)
+          .doc(itemId)
+          .get();
+
+      if (!itemSnap.exists) {
+        return res.status(404).json({
+          error: "Item not found.",
+        });
+      }
+
+      const id = makeId();
+
+      await spendsRef(req.username)
+        .doc(id)
+        .set({
+          itemId,
+          month,
+          amount,
+          note,
+          spentOn,
+          createdAt:
+            FieldValue.serverTimestamp(),
+        });
+
+      res.json({
+        id,
+        itemId,
+        amount,
+        note,
+        spentOn,
+      });
+    } catch (error) {
+      console.error(error);
+
+      res.status(500).json({
+        error: "Could not save spend.",
+      });
+    }
+  }
+);
+
+// ============================================================
+// DELETE SPEND
+// ============================================================
+
+app.delete(
+  "/api/spends/:id",
+  requireAuth,
+  async (req, res) => {
+    try {
+      const id = req.params.id;
+
+      const ref = spendsRef(
+        req.username
+      ).doc(id);
+
+      const snap = await ref.get();
+
+      if (!snap.exists) {
+        return res.status(404).json({
+          error: "Spend not found.",
+        });
+      }
+
+      await ref.delete();
+
+      res.json({
+        ok: true,
+      });
+    } catch (error) {
+      console.error(error);
+
+      res.status(500).json({
+        error: "Could not delete spend.",
+      });
+    }
+  }
+);
+
+// ============================================================
+// WEBSITE
+// ============================================================
+
+const HTML = `
+<!DOCTYPE html>
+<html lang="en">
+<head>
+
+<meta charset="UTF-8">
+
+<meta
+  name="viewport"
+  content="width=device-width, initial-scale=1.0"
+/>
+
+<title>Home Monthly Budget</title>
+
+<style>
+
+* {
+  box-sizing: border-box;
+}
+
+body {
+  margin: 0;
+  font-family:
+    Arial,
+    Helvetica,
+    sans-serif;
+
+  background:
+    linear-gradient(
+      135deg,
+      #f3f6ff,
+      #ffffff
+    );
+
+  color: #182230;
+}
+
+button,
+input {
+  font: inherit;
+}
+
+button {
+  cursor: pointer;
+}
+
+.hidden {
+  display: none !important;
+}
+
+/* LOGIN */
+
+.login-page {
+  min-height: 100vh;
+
+  display: flex;
+  align-items: center;
+  justify-content: center;
+
+  padding: 20px;
+}
+
+.login-card {
+  width: 100%;
+  max-width: 420px;
+
+  background: white;
+
+  padding: 30px;
+
+  border-radius: 24px;
+
+  box-shadow:
+    0 20px 60px
+    rgba(0,0,0,.12);
+}
+
+.logo {
+  width: 70px;
+  height: 70px;
+
+  border-radius: 20px;
+
+  display: flex;
+  align-items: center;
+  justify-content: center;
+
+  margin: 0 auto 20px;
+
+  font-size: 34px;
+
+  background: #eef2ff;
+}
+
+.login-card h1 {
+  text-align: center;
+
+  margin: 0 0 8px;
+
+  font-size: 28px;
+}
+
+.login-card p {
+  text-align: center;
+
+  color: #687386;
+
+  margin-bottom: 25px;
+}
+
+.form-group {
+  margin-bottom: 15px;
+}
+
+label {
+  display: block;
+
+  margin-bottom: 7px;
+
+  font-size: 14px;
+
+  font-weight: 700;
+}
+
+input {
+  width: 100%;
+
+  padding: 13px 14px;
+
+  border: 1px solid #d8dee9;
+
+  border-radius: 12px;
+
+  outline: none;
+
+  background: #fff;
+}
+
+input:focus {
+  border-color: #5865f2;
+
+  box-shadow:
+    0 0 0 3px
+    rgba(88,101,242,.12);
+}
+
+.primary {
+  width: 100%;
+
+  border: 0;
+
+  padding: 14px;
+
+  border-radius: 12px;
+
+  background: #5865f2;
+
+  color: white;
+
+  font-weight: 700;
+
+  font-size: 16px;
+}
+
+.primary:hover {
+  background: #4752c4;
+}
+
+.error {
+  color: #d32f2f;
+
+  text-align: center;
+
+  margin-top: 12px;
+
+  font-size: 14px;
+}
+
+/* APP */
+
+.app {
+  min-height: 100vh;
+}
+
+.topbar {
+  position: sticky;
+  top: 0;
+  z-index: 10;
+
+  background: white;
+
+  border-bottom:
+    1px solid #e5e9f0;
+
+  padding: 14px 20px;
+
+  display: flex;
+
+  justify-content: space-between;
+
+  align-items: center;
+}
+
+.brand {
+  font-size: 19px;
+
+  font-weight: 800;
+}
+
+.user-area {
+  display: flex;
+
+  align-items: center;
+
+  gap: 10px;
+}
+
+.user-name {
+  font-weight: 700;
+
+  color: #5865f2;
+}
+
+.logout {
+  border: 0;
+
+  background: #f1f3f7;
+
+  padding: 9px 13px;
+
+  border-radius: 10px;
+}
+
+.container {
+  max-width: 1100px;
+
+  margin: auto;
+
+  padding: 25px 18px 50px;
+}
+
+/* MONTH */
+
+.month-bar {
+  display: flex;
+
+  gap: 10px;
+
+  align-items: center;
+
+  margin-bottom: 20px;
+
+  flex-wrap: wrap;
+}
+
+.month-bar input {
+  width: 180px;
+}
+
+.month-title {
+  font-size: 24px;
+
+  font-weight: 800;
+
+  flex: 1;
+}
+
+/* CARDS */
+
+.stats {
+  display: grid;
+
+  grid-template-columns:
+    repeat(3, 1fr);
+
+  gap: 15px;
+
+  margin-bottom: 20px;
+}
+
+.card {
+  background: white;
+
+  border-radius: 18px;
+
+  padding: 20px;
+
+  box-shadow:
+    0 8px 30px
+    rgba(0,0,0,.06);
+}
+
+.stat-label {
+  color: #697586;
+
+  font-size: 14px;
+
+  margin-bottom: 7px;
+}
+
+.stat-value {
+  font-size: 26px;
+
+  font-weight: 800;
+}
+
+.leftover {
+  color: #16833b;
+}
+
+/* BUDGET */
+
+.budget-box {
+  display: flex;
+
+  gap: 10px;
+
+  align-items: end;
+
+  margin-bottom: 20px;
+
+  flex-wrap: wrap;
+}
+
+.budget-box .form-group {
+  margin: 0;
+}
+
+.budget-box input {
+  width: 180px;
+}
+
+.small-btn {
+  border: 0;
+
+  background: #5865f2;
+
+  color: white;
+
+  padding: 12px 16px;
+
+  border-radius: 11px;
+
+  font-weight: 700;
+}
+
+/* ITEMS */
+
+.section-title {
+  font-size: 21px;
+
+  font-weight: 800;
+
+  margin:
+    25px 0 13px;
+}
+
+.items {
+  display: grid;
+
+  grid-template-columns:
+    repeat(2, 1fr);
+
+  gap: 15px;
+}
+
+.item-card {
+  background: white;
+
+  border-radius: 18px;
+
+  padding: 18px;
+
+  box-shadow:
+    0 8px 30px
+    rgba(0,0,0,.06);
+}
+
+.item-header {
+  display: flex;
+
+  justify-content: space-between;
+
+  align-items: start;
+
+  gap: 10px;
+}
+
+.item-name {
+  font-weight: 800;
+
+  font-size: 17px;
+}
+
+.item-spent {
+  margin-top: 5px;
+
+  color: #697586;
+
+  font-size: 14px;
+}
+
+.item-actions {
+  display: flex;
+
+  gap: 5px;
+}
+
+.icon-btn {
+  border: 0;
+
+  background: #f1f3f7;
+
+  border-radius: 8px;
+
+  padding: 7px 9px;
+}
+
+.progress {
+  height: 8px;
+
+  background: #edf0f5;
+
+  border-radius: 99px;
+
+  margin:
+    14px 0;
+}
+
+.progress-bar {
+  height: 100%;
+
+  background: #5865f2;
+
+  border-radius: 99px;
+
+  width: 0%;
+}
+
+.spend-list {
+  margin-top: 10px;
+}
+
+.spend-row {
+  display: flex;
+
+  justify-content: space-between;
+
+  gap: 10px;
+
+  padding: 9px 0;
+
+  border-top:
+    1px solid #eef0f4;
+
+  font-size: 14px;
+}
+
+.spend-note {
+  color: #687386;
+}
+
+.spend-amount {
+  font-weight: 800;
+}
+
+.delete-spend {
+  border: 0;
+
+  background: transparent;
+
+  color: #d32f2f;
+
+  font-size: 12px;
+}
+
+/* ADD */
+
+.add-box {
+  display: flex;
+
+  gap: 10px;
+
+  margin-top: 15px;
+}
+
+.add-box input {
+  flex: 1;
+}
+
+/* NEXT */
+
+.next-card {
+  margin-top: 25px;
+
+  background: #fff;
+
+  border-radius: 18px;
+
+  padding: 20px;
+
+  box-shadow:
+    0 8px 30px
+    rgba(0,0,0,.06);
+}
+
+.next-card h3 {
+  margin-top: 0;
+}
+
+.next-grid {
+  display: grid;
+
+  grid-template-columns:
+    repeat(2, 1fr);
+
+  gap: 10px;
+}
+
+.next-item {
+  background: #f7f8fb;
+
+  padding: 12px;
+
+  border-radius: 12px;
+}
+
+/* TOAST */
+
+.toast {
+  position: fixed;
+
+  bottom: 20px;
+
+  left: 50%;
+
+  transform:
+    translateX(-50%);
+
+  background: #182230;
+
+  color: white;
+
+  padding: 12px 18px;
+
+  border-radius: 12px;
+
+  display: none;
+
+  z-index: 100;
+}
+
+/* MOBILE */
+
+@media (max-width: 700px) {
+
+  .stats {
+    grid-template-columns: 1fr;
+  }
+
+  .items {
+    grid-template-columns: 1fr;
+  }
+
+  .next-grid {
+    grid-template-columns: 1fr;
+  }
+
+  .topbar {
+    padding: 12px;
+  }
+
+  .user-name {
+    display: none;
+  }
+
+  .month-title {
+    width: 100%;
+
+    flex-basis: 100%;
+
+    font-size: 21px;
+  }
+
+  .month-bar input {
+    width: 100%;
+  }
+
+  .budget-box input {
+    width: 100%;
+  }
+
+  .budget-box {
+    align-items: stretch;
+  }
+
+  .small-btn {
+    width: 100%;
+  }
+
+  .add-box {
+    flex-direction: column;
+  }
+
+}
+
+</style>
+
+</head>
+
+<body>
+
+<!-- LOGIN -->
+
+<div id="loginPage" class="login-page">
+
+  <div class="login-card">
+
+    <div class="logo">
+      💰
+    </div>
+
+    <h1>Home Budget</h1>
+
+    <p>
+      Monthly budget manager
+    </p>
+
+    <form id="loginForm">
+
+      <div class="form-group">
+
+        <label>
+          Username
+        </label>
+
+        <input
+          id="username"
+          autocomplete="username"
+          placeholder="vicky"
+          required
+        >
+
+      </div>
+
+      <div class="form-group">
+
+        <label>
+          Password
+        </label>
+
+        <input
+          id="password"
+          type="password"
+          autocomplete="current-password"
+          placeholder="Password"
+          required
+        >
+
+      </div>
+
+      <button
+        class="primary"
+        type="submit"
+      >
+        Login
+      </button>
+
+      <div
+        id="loginError"
+        class="error"
+      ></div>
+
+    </form>
+
+  </div>
+
+</div>
+
+<!-- APP -->
+
+<div
+  id="app"
+  class="app hidden"
+>
+
+  <div class="topbar">
+
+    <div class="brand">
+      💰 Home Budget
+    </div>
+
+    <div class="user-area">
+
+      <span
+        id="userName"
+        class="user-name"
+      ></span>
+
+      <button
+        id="logoutBtn"
+        class="logout"
+      >
+        Logout
+      </button>
+
+    </div>
+
+  </div>
+
+  <main class="container">
+
+    <div class="month-bar">
+
+      <div
+        id="monthTitle"
+        class="month-title"
+      >
+        Month
+      </div>
+
+      <input
+        id="monthPicker"
+        type="month"
+      >
+
+    </div>
+
+    <div class="stats">
+
+      <div class="card">
+
+        <div class="stat-label">
+          Monthly Budget
+        </div>
+
+        <div
+          id="budgetValue"
+          class="stat-value"
+        >
+          ₹0
+        </div>
+
+      </div>
+
+      <div class="card">
+
+        <div class="stat-label">
+          Total Spent
+        </div>
+
+        <div
+          id="spentValue"
+          class="stat-value"
+        >
+          ₹0
+        </div>
+
+      </div>
+
+      <div class="card">
+
+        <div class="stat-label">
+          Remaining
+        </div>
+
+        <div
+          id="leftoverValue"
+          class="stat-value leftover"
+        >
+          ₹0
+        </div>
+
+      </div>
+
+    </div>
+
+    <div class="card">
+
+      <div class="section-title">
+        Monthly Budget
+      </div>
+
+      <div class="budget-box">
+
+        <div class="form-group">
+
+          <label>
+            Budget amount (₹)
+          </label>
+
+          <input
+            id="budgetInput"
+            type="number"
+            min="0"
+            step="1"
+          >
+
+        </div>
+
+        <button
+          id="saveBudgetBtn"
+          class="small-btn"
+        >
+          Save Budget
+        </button>
+
+      </div>
+
+    </div>
+
+    <div class="section-title">
+      Spending Items
+    </div>
+
+    <div
+      id="items"
+      class="items"
+    ></div>
+
+    <div class="card">
+
+      <div class="section-title">
+        Add New Item
+      </div>
+
+      <div class="add-box">
+
+        <input
+          id="newItem"
+          placeholder="Example: Internet bill"
+        >
+
+        <button
+          id="addItemBtn"
+          class="small-btn"
+        >
+          Add Item
+        </button>
+
+      </div>
+
+    </div>
+
+    <div class="next-card">
+
+      <h3>
+        Next Month Preview
+      </h3>
+
+      <p id="nextMonthLabel">
+        Next month
+      </p>
+
+      <div
+        id="nextGrid"
+        class="next-grid"
+      ></div>
+
+    </div>
+
+  </main>
+
+</div>
+
+<div
+  id="toast"
+  class="toast"
+></div>
+
+<script>
+
+let currentMonth = "";
+let currentData = null;
+
+const loginPage =
+  document.getElementById("loginPage");
+
+const app =
+  document.getElementById("app");
+
+const loginForm =
+  document.getElementById("loginForm");
+
+const loginError =
+  document.getElementById("loginError");
+
+const usernameInput =
+  document.getElementById("username");
+
+const passwordInput =
+  document.getElementById("password");
+
+const userName =
+  document.getElementById("userName");
+
+const monthPicker =
+  document.getElementById("monthPicker");
+
+const monthTitle =
+  document.getElementById("monthTitle");
+
+const itemsContainer =
+  document.getElementById("items");
+
+const budgetValue =
+  document.getElementById("budgetValue");
+
+const spentValue =
+  document.getElementById("spentValue");
+
+const leftoverValue =
+  document.getElementById("leftoverValue");
+
+const budgetInput =
+  document.getElementById("budgetInput");
+
+const nextGrid =
+  document.getElementById("nextGrid");
+
+const nextMonthLabel =
+  document.getElementById("nextMonthLabel");
+
+function money(value) {
+
+  return new Intl.NumberFormat(
+    "en-IN",
+    {
+      style: "currency",
+      currency: "INR",
+      maximumFractionDigits: 0
+    }
+  ).format(Number(value || 0));
+
+}
+
+function showToast(message) {
+
+  const toast =
+    document.getElementById("toast");
+
+  toast.textContent = message;
+
+  toast.style.display = "block";
+
+  setTimeout(() => {
+
+    toast.style.display = "none";
+
+  }, 2200);
+
+}
+
+function todayMonth() {
+
+  const d = new Date();
+
+  return (
+    d.getFullYear() +
+    "-" +
+    String(
+      d.getMonth() + 1
+    ).padStart(2, "0")
+  );
+
+}
+
+function todayDate() {
+
+  const d = new Date();
+
+  return (
+    d.getFullYear() +
+    "-" +
+    String(
+      d.getMonth() + 1
+    ).padStart(2, "0") +
+    "-" +
+    String(
+      d.getDate()
+    ).padStart(2, "0")
+  );
+
+}
+
+async function api(
+  url,
+  options = {}
+) {
+
+  const response =
+    await fetch(url, {
+      ...options,
+
+      headers: {
+        "Content-Type":
+          "application/json",
+
+        ...(options.headers || {})
+      }
+    });
+
+  let data = {};
+
+  try {
+    data = await response.json();
+  } catch {}
+
+  if (!response.ok) {
+
+    throw new Error(
+      data.error ||
+      "Something went wrong."
+    );
+
+  }
+
+  return data;
+
+}
+
+async function checkLogin() {
+
+  try {
+
+    const me =
+      await api("/api/me");
+
+    userName.textContent =
+      me.username;
+
+    loginPage.classList.add(
+      "hidden"
+    );
+
+    app.classList.remove(
+      "hidden"
+    );
+
+    currentMonth =
+      todayMonth();
+
+    monthPicker.value =
+      currentMonth;
+
+    await loadMonth();
+
+  } catch {
+
+    loginPage.classList.remove(
+      "hidden"
+    );
+
+    app.classList.add(
+      "hidden"
+    );
+
+  }
+
+}
+
+loginForm.addEventListener(
+  "submit",
+  async (event) => {
+
+    event.preventDefault();
+
+    loginError.textContent =
+      "";
+
+    try {
+
+      const data =
+        await api(
+          "/api/login",
+          {
+            method: "POST",
+
+            body: JSON.stringify({
+              username:
+                usernameInput.value,
+
+              password:
+                passwordInput.value
+            })
+          }
+        );
+
+      userName.textContent =
+        data.username;
+
+      loginPage.classList.add(
+        "hidden"
+      );
+
+      app.classList.remove(
+        "hidden"
+      );
+
+      currentMonth =
+        todayMonth();
+
+      monthPicker.value =
+        currentMonth;
+
+      passwordInput.value =
+        "";
+
+      await loadMonth();
+
+    } catch (error) {
+
+      loginError.textContent =
+        error.message;
+
+    }
+
+  }
+);
+
+document
+  .getElementById("logoutBtn")
+  .addEventListener(
+    "click",
+    async () => {
+
+      await api(
+        "/api/logout",
+        {
+          method: "POST"
+        }
+      );
+
+      app.classList.add(
+        "hidden"
+      );
+
+      loginPage.classList.remove(
+        "hidden"
+      );
+
+      usernameInput.value =
+        "";
+
+      passwordInput.value =
+        "";
+
+    }
+  );
+
+monthPicker.addEventListener(
+  "change",
+  async () => {
+
+    if (!monthPicker.value) {
+      return;
+    }
+
+    currentMonth =
+      monthPicker.value;
+
+    await loadMonth();
+
+  }
+);
+
+async function loadMonth() {
+
+  try {
+
+    const data =
+      await api(
+        "/api/month?month=" +
+        encodeURIComponent(
+          currentMonth
+        )
+      );
+
+    currentData =
+      data;
+
+    render(data);
+
+  } catch (error) {
+
+    showToast(
+      error.message
+    );
+
+  }
+
+}
+
+function render(data) {
+
+  monthTitle.textContent =
+    data.label;
+
+  budgetValue.textContent =
+    money(data.budget);
+
+  spentValue.textContent =
+    money(data.spent);
+
+  leftoverValue.textContent =
+    money(data.leftover);
+
+  leftoverValue.style.color =
+    data.leftover < 0
+      ? "#d32f2f"
+      : "#16833b";
+
+  budgetInput.value =
+    data.budget;
+
+  renderItems(
+    data.items,
+    data.budget
+  );
+
+  nextMonthLabel.textContent =
+    data.next.label +
+    " • Budget: " +
+    money(data.next.budget);
+
+  nextGrid.innerHTML =
+    "";
+
+  data.items.forEach(
+    item => {
+
+      const div =
+        document.createElement(
+          "div"
+        );
+
+      div.className =
+        "next-item";
+
+      div.innerHTML =
+        `<strong>${escapeHtml(item.name)}</strong><br><span>Planned spent: ${money(item.nextSpent)}</span>`;
+
+      nextGrid.appendChild(
+        div
+      );
+
+    }
+  );
+
+}
+
+function escapeHtml(value) {
+
+  return String(value)
+    .replaceAll("&", "&amp;")
+    .replaceAll("<", "&lt;")
+    .replaceAll(">", "&gt;")
+    .replaceAll('"', "&quot;")
+    .replaceAll("'", "&#039;");
+
+}
+
+function renderItems(
+  items,
+  budget
+) {
+
+  itemsContainer.innerHTML =
+    "";
+
+  items.forEach(
+    item => {
+
+      const card =
+        document.createElement("div");
+
+      card.className =
+        "item-card";
+
+      const percent =
+        budget > 0
+          ? Math.min(
+              100,
+              (item.spent /
+                budget) *
+                100
+            )
+          : 0;
+
+      const spends =
+        item.spends || [];
+
+      card.innerHTML = `
+        <div class="item-header">
+          <div>
+            <div class="item-name">
+              ${escapeHtml(
+                item.name
+              )}
+            </div>
+            <div class="item-spent">
+              Spent:
+              ${money(
+                item.spent
+              )}
+            </div>
+          </div>
+          <div class="item-actions">
+            <button
+              class="icon-btn edit-item"
+              title="Edit"
+            >
+              ✏️
+            </button>
+            <button
+              class="icon-btn delete-item"
+              title="Delete"
+            >
+              🗑️
+            </button>
+
+          </div>
+
+        </div>
+
+        <div class="progress">
+
+          <div
+            class="progress-bar"
+            style="width:${percent}%"
+          ></div>
+
+        </div>
+
+        <button
+          class="small-btn add-spend"
+          style="width:100%"
+        >
+          + Add Spending
+        </button>
+
+        <div class="spend-list"></div>
+
+      `;
+
+      const spendList =
+        card.querySelector(
+          ".spend-list"
+        );
+
+      spends.forEach(
+        spend => {
+
+          const row =
+            document.createElement(
+              "div"
+            );
+
+          row.className =
+            "spend-row";
+
+          row.innerHTML = `
+
+            <div>
+
+              <strong>
+                ${money(
+                  spend.amount
+                )}
+              </strong>
+
+              <br>
+
+              <span class="spend-note">
+                ${escapeHtml(
+                  spend.note ||
+                  "No note"
+                )}
+                &bull;
+                ${escapeHtml(
+                  spend.spentOn
+                )}
+              </span>
+
+            </div>
+
+            <button
+              class="delete-spend"
+            >
+              Delete
+            </button>
+
+          `;
+
+          row
+            .querySelector(
+              ".delete-spend"
+            )
+            .addEventListener(
+              "click",
+              () =>
+                deleteSpend(
+                  spend.id
+                )
+            );
+
+          spendList.appendChild(
+            row
+          );
+
+        }
+      );
+
+      card
+        .querySelector(
+          ".edit-item"
+        )
+        .addEventListener(
+          "click",
+          () =>
+            editItem(item)
+        );
+
+      card
+        .querySelector(
+          ".delete-item"
+        )
+        .addEventListener(
+          "click",
+          () =>
+            removeItem(item)
+        );
+
+      card
+        .querySelector(
+          ".add-spend"
+        )
+        .addEventListener(
+          "click",
+          () =>
+            addSpend(item)
+        );
+
+      itemsContainer.appendChild(
+        card
+      );
+
+    }
+  );
+
+}
+
+async function editItem(item) {
+
+  const name =
+    prompt(
+      "Enter new item name:",
+      item.name
+    );
+
+  if (
+    name === null ||
+    !name.trim()
+  ) {
+    return;
+  }
+
+  try {
+
+    await api(
+      "/api/items/" +
+      item.id,
+      {
+        method: "PATCH",
+
+        body: JSON.stringify({
+          name: name.trim()
+        })
+      }
+    );
+
+    showToast(
+      "Item updated."
+    );
+
+    await loadMonth();
+
+  } catch (error) {
+
+    showToast(
+      error.message
+    );
+
+  }
+
+}
+
+async function removeItem(item) {
+
+  const ok =
+    confirm(
+      "Delete '" +
+      item.name +
+      "' and all its spending records?"
+    );
+
+  if (!ok) return;
+
+  try {
+
+    await api(
+      "/api/items/" +
+      item.id,
+      {
+        method: "DELETE"
+      }
+    );
+
+    showToast(
+      "Item deleted."
+    );
+
+    await loadMonth();
+
+  } catch (error) {
+
+    showToast(
+      error.message
+    );
+
+  }
+
+}
+
+async function addSpend(item) {
+
+  const amountText =
+    prompt(
+      "Enter spending amount (₹):"
+    );
+
+  if (
+    amountText === null
+  ) {
+    return;
+  }
+
+  const amount =
+    Number(amountText);
+
+  if (
+    !Number.isFinite(amount) ||
+    amount <= 0
+  ) {
+
+    showToast(
+      "Enter a valid amount."
+    );
+
+    return;
+
+  }
+
+  const note =
+    prompt(
+      "Enter note (optional):"
+    ) || "";
+
+  const spentOn =
+    prompt(
+      "Enter date YYYY-MM-DD:",
+      todayDate()
+    );
+
+  if (!spentOn) {
+    return;
+  }
+
+  try {
+
+    await api(
+      "/api/spends",
+      {
+        method: "POST",
+
+        body: JSON.stringify({
+          month:
+            currentMonth,
+
+          itemId:
+            item.id,
+
+          amount,
+
+          note,
+
+          spentOn
+        })
+      }
+    );
+
+    showToast(
+      "Spending added."
+    );
+
+    await loadMonth();
+
+  } catch (error) {
+
+    showToast(
+      error.message
+    );
+
+  }
+
+}
+
+async function deleteSpend(id) {
+
+  const ok =
+    confirm(
+      "Delete this spending record?"
+    );
+
+  if (!ok) return;
+
+  try {
+
+    await api(
+      "/api/spends/" +
+      id,
+      {
+        method: "DELETE"
+      }
+    );
+
+    showToast(
+      "Spending deleted."
+    );
+
+    await loadMonth();
+
+  } catch (error) {
+
+    showToast(
+      error.message
+    );
+
+  }
+
+}
+
+document
+  .getElementById("saveBudgetBtn")
+  .addEventListener(
+    "click",
+    async () => {
+
+      const amount =
+        Number(
+          budgetInput.value
+        );
+
+      if (
+        !Number.isFinite(amount) ||
+        amount < 0
+      ) {
+
+        showToast(
+          "Enter a valid budget."
+        );
+
+        return;
+
+      }
+
+      try {
+
+        await api(
+          "/api/budget",
+          {
+            method: "PUT",
+
+            body: JSON.stringify({
+              month:
+                currentMonth,
+
+              amount
+            })
+          }
+        );
+
+        showToast(
+          "Budget saved."
+        );
+
+        await loadMonth();
+
+      } catch (error) {
+
+        showToast(
+          error.message
+        );
+
+      }
+
+    }
+  );
+
+document
+  .getElementById("addItemBtn")
+  .addEventListener(
+    "click",
+    async () => {
+
+      const input =
+        document.getElementById(
+          "newItem"
+        );
+
+      const name =
+        input.value.trim();
+
+      if (!name) {
+
+        showToast(
+          "Enter an item name."
+        );
+
+        return;
+
+      }
+
+      try {
+
+        await api(
+          "/api/items",
+          {
+            method: "POST",
+
+            body: JSON.stringify({
+              name
+            })
+          }
+        );
+
+        input.value =
+          "";
+
+        showToast(
+          "Item added."
+        );
+
+        await loadMonth();
+
+      } catch (error) {
+
+        showToast(
+          error.message
+        );
+
+      }
+
+    }
+  );
+
+checkLogin();
+
+</script>
+
+</body>
+</html>
+`;
+
+// ============================================================
+// SERVE WEBSITE
+// ============================================================
+
+app.get(
+  "/",
+  async (req, res) => {
+
+    res.setHeader(
+      "Cache-Control",
+      "no-store"
+    );
+
+    res.type("html").send(HTML);
+
+  }
+);
+
+// ============================================================
+// EXPORT FIREBASE FUNCTION
+// ============================================================
+
+exports.app = onRequest(
+  {
+    region: "us-central1",
+    memory: "256MiB",
+    timeoutSeconds: 60,
+    maxInstances: 10,
+  },
+  app
+);
